@@ -19,33 +19,30 @@ app.post('/api/get-price', async (req, res) => {
 
   let browser;
   try {
-    // Запускаем невидимый браузер Chromium
     browser = await puppeteer.launch({
       headless: "new",
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
     const page = await browser.newPage();
-    
-    // Настраиваем размер экрана и यूजर-агент, как у обычного человека
     await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
     // 1. Переходим на страницу логина
     await page.goto('https://partners.xclusiveyachts.com/login/', { waitUntil: 'networkidle2' });
 
-    // 2. Вводим логин и пароль в поля по их точным ID из HTML
+    // 2. Вводим логин и пароль
     await page.type('#login_form_username', PARTNER_EMAIL);
     await page.type('#login_form_password', PARTNER_PASSWORD);
 
-    // 3. Кликаем на кнопку входа и ждем, пока страница перезагрузится
+    // 3. Кликаем на кнопку входа
     await Promise.all([
       page.click('button[type="submit"]'),
       page.waitForNavigation({ waitUntil: 'networkidle2' })
     ]);
 
-    // 4. Теперь, когда браузер авторизован, выполняем fetch прямо внутри контекста этой страницы
-    const priceData = await page.evaluate(async (date, time, hrs, gst) => {
+    // 4. Выполняем fetch-запрос к оригинальному API доступности
+    const rawPriceData = await page.evaluate(async (date, time, hrs, gst) => {
       const response = await fetch("https://partners.xclusiveyachts.com/private-charter/availability/", {
         method: "POST",
         headers: {
@@ -58,15 +55,40 @@ app.post('/api/get-price', async (req, res) => {
       return response.json();
     }, charter_date, charter_time, hours, guests);
 
-    // Возвращаем чистый JSON клиенту (в Bubble)
-    res.json(priceData);
+    // 5. ТРАНСФОРМАЦИЯ КОРНЕВОГО ОБЪЕКТА AVAILABLE В МАССИВ ДЛЯ BUBBLE.IO
+    const formattedResponse = {
+      success: rawPriceData.success ?? true,
+      count: rawPriceData.count ?? 0,
+      selected_date: rawPriceData.selected_date ?? charter_date,
+      selected_time: rawPriceData.selected_time ?? charter_time,
+      searched_at: rawPriceData.searched_at ?? new Date().toISOString(),
+      available: [] // Сюда соберем массив яхт
+    };
+
+    // Перебираем динамические ключи (ID яхт) из оригинального ответа
+    if (rawPriceData && rawPriceData.available && typeof rawPriceData.available === 'object') {
+      Object.keys(rawPriceData.available).forEach(yachtId => {
+        const yachtDetails = rawPriceData.available[yachtId];
+        
+        if (yachtDetails && typeof yachtDetails === 'object') {
+          formattedResponse.available.push({
+            id: yachtId.toString(), // сохраняем ID ("4", "9", "10" и т.д.) внутри объекта
+            net_amount: yachtDetails.net_amount || 0,
+            net_formatted: yachtDetails.net_formatted || `AED ${yachtDetails.net_amount}`
+          });
+        }
+      });
+    }
+
+    // Отправляем измененный, чистый JSON в Bubble
+    res.json(formattedResponse);
 
   } catch (error) {
     console.error('Puppeteer Proxy Error:', error.message);
     res.status(500).json({ error: 'Failed to fetch price data', details: error.message });
   } finally {
     if (browser) {
-      await browser.close(); // Всегда закрываем браузер, чтобы не тратить память
+      await browser.close();
     }
   }
 });
@@ -74,3 +96,4 @@ app.post('/api/get-price', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
